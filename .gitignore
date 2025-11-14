@@ -1,0 +1,9 @@
+# Python cache/venv
+__pycache__/
+*.pyc
+.venv/
+
+# Local artifacts
+server/pd_auth.db
+.last_challenge.json
+.DS_Store
