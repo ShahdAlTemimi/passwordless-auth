@@ -1,10 +1,15 @@
+# client/cli.py
 import argparse
 import json
 import os
 import sys
 import httpx
 
+from local_keystore import save_secret, load_secret  # Phase 2 keystore
+
 API = "http://127.0.0.1:8000"
+
+# -------- Server commands (Phase 1) --------
 
 def cmd_register(a):
     payload = {
@@ -23,7 +28,6 @@ def cmd_login_start(a):
     r.raise_for_status()
     data = r.json()
     print(json.dumps(data, indent=2))
-    # keep the challenge_id locally for the next step
     with open(".last_challenge.json", "w") as f:
         json.dump({
             "username": a.username,
@@ -41,7 +45,7 @@ def cmd_login_complete(_a):
         "username": ch["username"],
         "device_id": ch["device_id"],
         "challenge_id": ch["challenge_id"],
-        "signature": None  # set in Phase 4
+        "signature": None
     }
     r = httpx.post(f"{API}/login/response", json=payload, timeout=10.0)
     r.raise_for_status()
@@ -58,10 +62,28 @@ def cmd_revoke(a):
     r.raise_for_status()
     print(json.dumps(r.json(), indent=2))
 
+# -------- Keystore commands (Phase 2) --------
+
+def cmd_ks_save(a):
+    secret = a.secret.encode()
+    path = save_secret(a.username, a.device_id, a.pin, secret)
+    print(f"saved: {path}")
+
+def cmd_ks_load(a):
+    secret, buf = load_secret(a.username, a.device_id, a.pin)
+    try:
+        # demo output; in real use, avoid printing secrets
+        print("secret (utf-8):", secret.decode(errors="replace"))
+        print("secret (hex):", secret.hex())
+    finally:
+        for i in range(len(buf)):
+            buf[i] = 0  # zeroize
+
 def main():
-    parser = argparse.ArgumentParser(prog="pd-auth", description="Client for Passwordless Auth (Phase 1)")
+    parser = argparse.ArgumentParser(prog="pd-auth", description="Client for Passwordless Auth")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
+    # Server
     r = sub.add_parser("register", help="register a new device")
     r.add_argument("--username", required=True)
     r.add_argument("--device-id", required=True)
@@ -85,6 +107,20 @@ def main():
     rv.add_argument("--username", required=True)
     rv.add_argument("--device-id", required=True)
     rv.set_defaults(func=cmd_revoke)
+
+    # Keystore
+    ks = sub.add_parser("ks-save", help="encrypt+store a secret with a PIN")
+    ks.add_argument("--username", required=True)
+    ks.add_argument("--device-id", required=True)
+    ks.add_argument("--pin", required=True)
+    ks.add_argument("--secret", required=True, help="text to store (e.g., 'hello')")
+    ks.set_defaults(func=cmd_ks_save)
+
+    kl = sub.add_parser("ks-load", help="decrypt and show the secret (demo)")
+    kl.add_argument("--username", required=True)
+    kl.add_argument("--device-id", required=True)
+    kl.add_argument("--pin", required=True)
+    kl.set_defaults(func=cmd_ks_load)
 
     args = parser.parse_args()
     args.func(args)
