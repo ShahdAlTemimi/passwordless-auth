@@ -1,5 +1,7 @@
+# server/db.py
 import sqlite3
 import json
+import base64
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -30,8 +32,8 @@ def init_db():
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       username TEXT NOT NULL,
       device_id TEXT NOT NULL,
-      public_key BLOB,
-      device_info TEXT NOT NULL,   -- JSON string
+      public_key BLOB,            -- raw bytes (Phase 3)
+      device_info TEXT NOT NULL,  -- JSON string
       device_hash BLOB,
       revoked INTEGER NOT NULL DEFAULT 0,
       registered_at TEXT NOT NULL,
@@ -103,6 +105,7 @@ def get_device(username, device_id):
     return dict(row) if row else None
 
 def list_devices(username):
+    """Return all devices for a user; public_key (if present) as base64 string."""
     conn = connect()
     cur = conn.cursor()
     cur.execute("""
@@ -111,7 +114,13 @@ def list_devices(username):
       WHERE username=?
       ORDER BY registered_at ASC
     """, (username,))
-    rows = [dict(r) for r in cur.fetchall()]
+    rows = []
+    for r in cur.fetchall():
+        item = dict(r)
+        # Convert bytes -> base64 text for JSON
+        if item.get("public_key") is not None:
+            item["public_key"] = base64.b64encode(item["public_key"]).decode()
+        rows.append(item)
     conn.close()
     return rows
 
