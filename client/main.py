@@ -1,267 +1,191 @@
-# client/main.py
-#
-# Interactive wizard client for Project D — Passwordless Auth (Phases 1-4).
-# Talks to the FastAPI server and uses the local keystore + Ed25519 keys.
-
+import os
 import json
-import sys
-import base64
-import httpx
-import getpass
-from typing import Optional
+import requests
+from cryptography.hazmat.primitives import serialization
 
-from local_keystore import save_secret, load_secret, load_blob, save_blob
-from keys import generate_and_store_keypair, sign_bytes, derive_public_key_b64_from_store
-from local_keystore import STORE_DIR
+# Import core crypto functions
+try:
+    from keys import (
+        generate_ed25519_keypair, 
+        encrypt_key_bytes, 
+        decrypt_key_bytes,
+        sign_challenge
+    )
+    from cryptography.exceptions import InvalidTag
+except ImportError:
+    print("Error: Could not import keys.py or its dependencies. Ensure keys.py is accessible.")
+    exit()
 
-API = "http://127.0.0.1:8000"
+# Configuration
+SERVER_URL = "http://127.0.0.1:8000"
+KEYSTORE_DIR = "./keystore"
 
+def get_user_input(prompt, default_value=None):
+    """Helper for command line input."""
+    if default_value:
+        return input(f"{prompt} [{default_value}]: ") or default_value
+    return input(f"{prompt}: ")
 
-# ------------- Helpers -------------
+def get_keystore_filepath(username: str, device_id: str) -> str:
+    """Returns the standardized path for the encrypted key file."""
+    return os.path.join(KEYSTORE_DIR, f"{username}-{device_id}.json")
 
-def ask(prompt: str, default: str | None = None) -> str:
-    """Simple input helper with optional default."""
-    if default is None:
-        return input(prompt).strip()
-    value = input(f"{prompt} [{default}]: ").strip()
-    return value or default
+def register_device():
+    """Handles keypair generation, local encryption (PIN), and server registration."""
+    print("\n--- PHASE 3: DEVICE REGISTRATION ---")
+    username = get_user_input("Enter username", "alice")
+    device_id = get_user_input("Enter device ID", "laptop")
+    pin = get_user_input("Enter local PIN to encrypt private key")
 
-
-def ask_pin(prompt_text: str = "Enter PIN: ") -> str:
-    """Use getpass so PIN is not shown on screen."""
-    return getpass.getpass(prompt_text).strip()
-
-
-def print_header(title: str) -> None:
-    print("\n" + "=" * 40)
-    print(" ", title)
-    print("=" * 40 + "\n")
-
-
-def pretty_print(obj) -> None:
-    """Print JSON or text nicely."""
-    if isinstance(obj, (dict, list)):
-        print(json.dumps(obj, indent=2))
-    else:
-        print(obj)
-
-
-def api_post(path: str, json_body: dict):
-    """Wrapper around POST with basic error handling."""
-    url = f"{API}{path}"
-    try:
-        r = httpx.post(url, json=json_body)
-        r.raise_for_status() # Raise an exception for 4xx or 5xx status codes
-        return r.json()
-    except httpx.HTTPStatusError as e:
-        print(f"[!] API Error: {e.response.status_code} {e.response.reason_phrase}")
-        try:
-            error_detail = e.response.json().get("detail")
-            if error_detail:
-                print(f"[!] Detail: {error_detail}")
-        except:
-            pass
-        return None
-    except httpx.RequestError as e:
-        print(f"[!] An error occurred while requesting {e.request.url!r}: {e}")
-        print("[!] Is the FastAPI server running?")
-        return None
-
-
-# ------------- Actions -------------
-
-def action_register():
-    """Phase 3: Generate keypair, store private key locally, send public key to server."""
-    print_header("1) Register New Device (Phase 3)")
-    username = ask("Enter username (e.g., sara.c)")
-    device_id = ask("Enter device ID (e.g., work_laptop)")
-    pin = ask_pin("Choose a PIN (used for local key encryption): ")
-
-    device_info = {
-        "os": sys.platform,
-        "client": "python-cli",
-        "key_type": "Ed25519",
-    }
-
-    try:
-        # Phase 3: Generate keypair, store private key, get public key
-        public_key_b64 = generate_and_store_keypair(username, device_id, pin)
-        print(f"[+] Keypair generated and private key securely stored locally.")
-        print(f"[+] Public Key (b64): {public_key_b64[:10]}...{public_key_b64[-10:]}")
-    except Exception as e:
-        print(f"[!] Failed to generate/store keypair: {e}")
+    filepath = get_keystore_filepath(username, device_id)
+    if os.path.exists(filepath):
+        print(f"[CLIENT] Error: Device {device_id} is already registered locally.")
         return
 
-    # Phase 3: Send public key to server for registration
-    body = {
+    private_key, public_key = generate_ed25519_keypair()
+    
+    private_key_bytes = private_key.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+    public_key_bytes = public_key.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw
+    )
+
+    encrypted_data = encrypt_key_bytes(private_key_bytes, pin)
+
+    os.makedirs(KEYSTORE_DIR, exist_ok=True)
+    with open(filepath, 'w') as f:
+        json.dump(encrypted_data, f)
+        
+    print(f"[CLIENT] Private key encrypted and saved locally: {filepath}")
+
+    register_data = {
         "username": username,
         "device_id": device_id,
-        "device_info": device_info,
-        "public_key": public_key_b64,
+        "public_key_hex": public_key_bytes.hex()
     }
 
-    result = api_post("/register", body)
-
-    if result:
-        print("\n[+] Registration Successful! Server Response:")
-        pretty_print(result)
-
-
-def action_login():
-    """Phase 4: Challenge-Response login with signature."""
-    print_header("2) Login (Phase 4: Challenge-Response)")
-    username = ask("Enter username (e.g., sara.c)")
-    device_id = ask("Enter device ID (e.g., work_laptop)")
-    pin = ask_pin("Enter your PIN to unlock the private key: ")
-
-    # 1. Get Challenge
-    print("\n-- 1. Requesting Challenge --")
-    challenge_body = {"username": username, "device_id": device_id}
-    challenge_result = api_post("/login/challenge", challenge_body)
-
-    if not challenge_result:
-        return
-
-    challenge_b64 = challenge_result["challenge"]
-    challenge_id = challenge_result["challenge_id"]
-
-    print(f"[+] Challenge received (ID: {challenge_id[:8]}...): {challenge_b64[:10]}...")
-
-    # 2. Sign Challenge (Client-side Cryptography)
     try:
-        # Decode the base64 challenge back to raw bytes
-        challenge_bytes = base64.b64decode(challenge_b64)
+        response = requests.post(f"{SERVER_URL}/register", json=register_data)
+        response.raise_for_status()
+        print(f"[SERVER] Registration successful: {response.json()['message']}")
+    except requests.exceptions.ConnectionError:
+        print(f"[ERROR] Could not connect to server at {SERVER_URL}. Is server/app.py running?")
+    except requests.exceptions.HTTPError as e:
+        print(f"[SERVER] Registration failed: {e.response.json().get('detail', 'Unknown error')}")
 
-        # Phase 4: Sign the challenge bytes with the locally stored private key
-        signature_bytes = sign_bytes(username, device_id, pin, challenge_bytes)
-        signature_b64 = base64.b64encode(signature_bytes).decode()
 
-        print(f"[+] Challenge signed successfully using private key.")
-        print(f"[+] Signature (b64): {signature_b64[:10]}...{signature_b64[-10:]}")
-
-    except FileNotFoundError:
-        print("[!] Error: No private key found. Did you forget to register (Option 1)?")
+def login_device():
+    """Handles the challenge-response authentication flow."""
+    print("\n--- PHASE 5: CHALLENGE-RESPONSE LOGIN ---")
+    username = get_user_input("Enter username", "alice")
+    device_id = get_user_input("Enter device ID", "laptop")
+    
+    filepath = get_keystore_filepath(username, device_id)
+    if not os.path.exists(filepath):
+        print(f"[CLIENT] Error: Keystore file not found at {filepath}. Please Register first.")
+        return
+        
+    # --- Step 1: Request Challenge from Server ---
+    print("\n[STEP 1] Requesting challenge...")
+    challenge_data = {"username": username, "device_id": device_id}
+    challenge_hex = None
+    try:
+        challenge_response = requests.post(f"{SERVER_URL}/login/challenge", json=challenge_data)
+        challenge_response.raise_for_status()
+        challenge_payload = challenge_response.json()
+        challenge_hex = challenge_payload.get('challenge_hex')
+        print(f"[SERVER] Challenge received: {challenge_hex[:16]}...")
+    except requests.exceptions.ConnectionError:
+        print(f"[ERROR] Could not connect to server at {SERVER_URL}. Is server/app.py running?")
+        return
+    except requests.exceptions.HTTPError as e:
+        print(f"[SERVER] Challenge failed: {e.response.json().get('detail', 'Unknown error')}")
+        return
+    
+    # --- Step 2: Client Side - Decrypt Key & Sign Challenge ---
+    
+    pin = get_user_input("Enter local PIN to unlock private key")
+    
+    try:
+        with open(filepath, 'r') as f:
+            encrypted_data = json.load(f)
+        
+        private_key_bytes = decrypt_key_bytes(encrypted_data, pin)
+        print("[CLIENT] Private key successfully decrypted and unlocked.")
+        
+    except InvalidTag:
+        print("[CLIENT] ERROR: Decryption failed! Incorrect PIN.")
         return
     except Exception as e:
-        print(f"[!] Error signing challenge (wrong PIN?): {e}")
+        print(f"[CLIENT] ERROR: Failed to load/decrypt key: {e}")
         return
+        
+    challenge_bytes = bytes.fromhex(challenge_hex)
+    signature_bytes = sign_challenge(private_key_bytes, challenge_bytes)
+    signature_hex = signature_bytes.hex()
+    print(f"[CLIENT] Challenge signed. Signature: {signature_hex[:16]}...")
 
-    # 3. Send Response (Challenge ID + Signature)
-    print("\n-- 3. Sending Response --")
-    response_body = {
+    # --- Step 3: Send Signature to Server for Verification ---
+    print("\n[STEP 3] Sending signature to server for verification...")
+    verify_data = {
         "username": username,
         "device_id": device_id,
-        "challenge_id": challenge_id,
-        "signature": signature_b64,  # Phase 4 requirement
+        "challenge_hex": challenge_hex,
+        "signature_hex": signature_hex
     }
-
-    session_result = api_post("/login/response", response_body)
-
-    if session_result:
-        print("\n[+] Login SUCCESSFUL! Session Granted.")
-        pretty_print(session_result)
-
-
-def action_list_devices():
-    """List devices for a user (Phase 6/partial)."""
-    print_header("3) List Registered Devices")
-    username = ask("Enter username (e.g., sara.c)")
-
-    result = api_post(f"/devices?username={username}", {})
-
-    if result is not None:
-        print("\n[+] Device List:")
-        pretty_print(result)
-
-
-def action_revoke():
-    """Revoke a device (Phase 6/partial)."""
-    print_header("4) Revoke a Device")
-    username = ask("Enter username (e.g., sara.c)")
-    device_id = ask("Enter device ID to revoke (e.g., old_phone)")
-
-    body = {"username": username, "device_id": device_id}
-    result = api_post("/devices/revoke", body)
-
-    if result:
-        print("\n[+] Revocation Successful! Server Response:")
-        pretty_print(result)
-
-
-def action_keystore_test():
-    """Phase 2: Test the local keystore functions."""
-    print_header("5) Keystore Test (Phase 2)")
-    username = ask("Enter test username", "test_user")
-    device_id = ask("Enter test device ID", "test_device")
-    pin = ask_pin("Choose a test PIN: ")
-    secret_text = ask("Enter a secret to store", "My Super Secret Text!")
-
-    secret_bytes = secret_text.encode("utf-8")
-
+    
     try:
-        path = save_secret(username, device_id, pin, secret_bytes)
-        print(f"\n[+] Secret saved to file: {path.name} in {STORE_DIR}")
-    except Exception as e:
-        print(f"[!] Failed to save secret: {e}")
-        return
+        verify_response = requests.post(f"{SERVER_URL}/login/verify", json=verify_data)
+        verify_response.raise_for_status()
+        
+        print("\n" + "="*50)
+        print(f"AUTHENTICATION SUCCESS: {verify_response.json()['message']}")
+        print("="*50)
 
-    try:
-        secret, buf = load_secret(username, device_id, pin)
-    except FileNotFoundError:
-        print("[!] Keystore file was not found during load.")
-        return
-    except Exception as e:
-        print(f"[!] Failed to load secret (Wrong PIN?): {e}")
-        return
+    except requests.exceptions.HTTPError as e:
+        detail = e.response.json().get('detail', 'Unknown error')
+        print("\n" + "#"*50)
+        print(f"AUTHENTICATION FAILED ({e.response.status_code}): {detail}")
+        print("#"*50)
+    except requests.exceptions.ConnectionError:
+        print(f"[ERROR] Could not connect to server at {SERVER_URL}. Is server/app.py running?")
+        
 
-    try:
-        # Check if the decrypted secret matches the original
-        if secret == secret_bytes:
-            print("\n[+] Decryption Successful!")
-            print("Decrypted secret (utf-8):", secret.decode("utf-8", errors="replace"))
-        else:
-            print("[!] Decryption Failed: Retrieved secret does not match original.")
+def revoke_device():
+    """Placeholder for revocation logic (Phase 6)."""
+    print("\n--- PHASE 6: REVOCATION ---")
+    print("This feature will be fully implemented in the next phase.")
 
-    finally:
-        # zeroize buffer
-        for i in range(len(buf)):
-            buf[i] = 0
-
-
-# ------------- Main loop -------------
 
 def main():
-    print("====================================")
-    print("  Project D — Passwordless Auth")
-
-    print("====================================\n")
-
+    """Main application loop and menu."""
+    print("Welcome to the Passwordless Authentication Client (Phase 5 Complete).")
+    print(f"Server Target: {SERVER_URL}")
+    
     while True:
-        print("Choose an action:")
-        print("  1) Register new device (with keypair)")
-        print("  2) Login from device (challenge–response)")
-        print("  3) List devices for a user (Phase 6/partial)")
-        print("  4) Revoke a device (Phase 6/partial)")
-        print("  5) Keystore test (Phase 2)")
-        print("  6) Exit")
-
-        choice = ask("Enter choice [1-6]: ")
-
-        if choice == "1":
-            action_register()
-        elif choice == "2":
-            action_login()
-        elif choice == "3":
-            action_list_devices()
-        elif choice == "4":
-            action_revoke()
-        elif choice == "5":
-            action_keystore_test()
-        elif choice == "6":
-            print("\nExiting.")
-            sys.exit(0)
+        print("\nChoose an action:")
+        print("  1) Register new device (Phase 3)") 
+        print("  2) Login from device (Phase 5)")
+        print("  3) Revoke a device (Phase 6 - Placeholder)")
+        print("  4) Exit")
+        
+        choice = get_user_input("Enter choice [1-4]")
+        
+        if choice == '1':
+            register_device()
+        elif choice == '2':
+            login_device()
+        elif choice == '3':
+            revoke_device()
+        elif choice == '4':
+            print("Exiting application. Goodbye!")
+            break
         else:
-            print("\nInvalid choice. Please enter a number from 1 to 6.")
+            print("Invalid choice.")
 
 if __name__ == "__main__":
     main()
