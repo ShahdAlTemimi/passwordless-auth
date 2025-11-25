@@ -1,111 +1,121 @@
 import os
-import uvicorn
 import time
+import hmac
+import hashlib
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Dict, Any
 
-# Internal imports
-import server.db as db
-from keys import verify_signature
+from . import db  
+from keys import verify_signature  
 
-# Global in-memory store for challenges
-CHALLENGE_STORE: Dict[tuple[str, str], Dict[str, Any]] = {}
+CHALLENGE_STORE = {}
 EXPIRATION_SECONDS = 300
 
-def set_challenge(username: str, device_id: str, challenge: bytes) -> bytes:
-    """Stores a new challenge nonce for a user/device in memory."""
-    key = (username, device_id)
-    CHALLENGE_STORE[key] = {
-        'challenge': challenge,
-        'timestamp': time.time()
-    }
+def get_challenge_key(username, device_id):
+    return f"{username}:{device_id}"
+
+def set_challenge(username, device_id, challenge):
+    key = get_challenge_key(username, device_id)
+    CHALLENGE_STORE[key] = {'challenge': challenge, 'timestamp': time.time()}
+    print(f"[CHALLENGE] stored for {username}/{device_id}: {challenge.hex()[:12]}...")
     return challenge
 
-def get_challenge(username: str, device_id: str, challenge_hex: str) -> bytes | None:
-    """Retrieves, validates, and removes the challenge nonce."""
-    key = (username, device_id)
-    
-    if key in CHALLENGE_STORE:
-        record = CHALLENGE_STORE[key]
-        
-        # Check for expiration or challenge mismatch.
-        if time.time() - record['timestamp'] > EXPIRATION_SECONDS or record['challenge'].hex() != challenge_hex:
-            del CHALLENGE_STORE[key]
-            return None
-
+def get_challenge(username, device_id, challenge_hex):
+    key = get_challenge_key(username, device_id)
+    record = CHALLENGE_STORE.get(key)
+    if not record:
+        return None
+    # expiration
+    if time.time() - record['timestamp'] > EXPIRATION_SECONDS:
         del CHALLENGE_STORE[key]
-        return record['challenge']
-        
-    return None
+        return None
+    # constant-time compare
+    if not hmac.compare_digest(record['challenge'].hex(), challenge_hex):
+        del CHALLENGE_STORE[key]
+        return None
+    del CHALLENGE_STORE[key]
+    return record['challenge']
 
-# Application Setup
+# App setup
 db.initialize_db()
-app = FastAPI(title="Passwordless Auth Server (Phase 5)")
+app = FastAPI(title="Passwordless Auth Server (Phase 5+)")
 
-# Request Models
 class DeviceInfo(BaseModel):
     username: str
     device_id: str
 
 class RegisterRequest(DeviceInfo):
     public_key_hex: str
-    
+
 class VerifyRequest(DeviceInfo):
     challenge_hex: str
     signature_hex: str
 
 @app.post("/register")
 def register(request: RegisterRequest):
-    """Handles device registration and stores the public key."""
-    if db.add_device(request.username, request.device_id, request.public_key_hex):
+    """Register device and save device_hash (Phase 5)."""
+    ok = db.add_device(request.username, request.device_id, request.public_key_hex)
+    if ok:
         return {"status": "success", "message": "Device registered successfully."}
-    else:
-        raise HTTPException(status_code=400, detail="Device already registered.")
+    raise HTTPException(status_code=400, detail="Device already registered.")
 
 @app.post("/login/challenge")
 def login_challenge(request: DeviceInfo):
-    """Issues a random challenge (nonce) for the client to sign."""
     device = db.get_device(request.username, request.device_id)
-    
     if not device:
         raise HTTPException(status_code=404, detail="User or device not found.")
-    
+    if device.get("revoked") == 1:
+        raise HTTPException(status_code=403, detail="Device has been revoked and cannot log in.")
     challenge = os.urandom(32)
     set_challenge(request.username, request.device_id, challenge)
-    
-    return {
-        "status": "success",
-        "challenge_hex": challenge.hex(),
-        "message": "Challenge issued. Sign it and send it to /login/verify."
-    }
+    return {"status": "success", "challenge_hex": challenge.hex(), "message": "Challenge issued."}
 
 @app.post("/login/verify")
 def login_verify(request: VerifyRequest):
-    """Verifies the client's signature against the stored challenge and public key."""
+    """Verify device integrity (Phase 5) then validate signature (Phase 4)."""
     device = db.get_device(request.username, request.device_id)
-
     if not device:
         raise HTTPException(status_code=404, detail="User or device not found.")
-    
+
+    # Revocation check
+    if device.get("revoked") == 1:
+        raise HTTPException(status_code=403, detail="Device is revoked.")
+
+    # === Minimal Phase 5 integrity check ===
+    stored_hash = device.get("device_hash")
+    if stored_hash:
+        expected = hashlib.sha256(f"{request.username}|{request.device_id}|{device['public_key_hex']}".encode()).hexdigest()
+        if expected != stored_hash:
+            # Log details for demo (crop these lines in your screenshot)
+            print("[ALERT] Integrity Mismatch!")
+            print(f"Stored:   {stored_hash[:20]}...")
+            print(f"Computed: {expected[:20]}...")
+            raise HTTPException(status_code=403, detail="Device integrity check failed.")
+
+    # === End integrity check ===
+
+    # Validate challenge
     stored_challenge = get_challenge(request.username, request.device_id, request.challenge_hex)
     if stored_challenge is None:
         raise HTTPException(status_code=400, detail="Invalid, expired, or reused challenge.")
 
+    # Verify signature
     try:
         public_key_bytes = bytes.fromhex(device['public_key_hex'])
         signature_bytes = bytes.fromhex(request.signature_hex)
-        
-        if verify_signature(public_key_bytes, stored_challenge, signature_bytes):
-            print(f"[SERVER] SUCCESS: {request.username}/{request.device_id} authenticated.")
-            return {"status": "success", "message": "Authentication successful. Access granted."}
-        else:
-            print(f"[SERVER] FAILURE: Invalid signature for {request.username}/{request.device_id}.")
-            raise HTTPException(status_code=401, detail="Authentication failed (Invalid Signature).")
-
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid hex formatting in request.")
 
-if __name__ == "__main__":
-    print("Run this file using: uvicorn server.app:app --reload")
-    print("Ensure you start the server before running client/main.py")
+    if verify_signature(public_key_bytes, stored_challenge, signature_bytes):
+        print(f"[SERVER] SUCCESS: {request.username}/{request.device_id} authenticated.")
+        return {"status": "success", "message": "Authentication successful. Access granted."}
+    else:
+        print(f"[SERVER] FAILURE: Invalid signature for {request.username}/{request.device_id}.")
+        raise HTTPException(status_code=401, detail="Authentication failed (Invalid Signature).")
+
+@app.post("/revoke")
+def revoke(request: DeviceInfo):
+    ok = db.revoke_device(request.username, request.device_id)
+    if ok:
+        return {"status": "success", "message": f"Device {request.device_id} revoked."}
+    raise HTTPException(status_code=404, detail="User or device not found.")
